@@ -42,15 +42,35 @@ export interface ScoredResult {
   };
 }
 
-// Grouped results for the UI — one entry per theater
+export interface SeatRecommendation {
+  seats: string[]; // e.g. ["G9", "G10", "G11"]
+  row: string; // e.g. "G"
+  rowNumber: number; // 1-indexed from screen
+  totalRows: number;
+  score: number;
+  description: string; // e.g. "Row G, Seats 9-11 (center, row 7 of 13)"
+}
+
+export interface PriceInfo {
+  adult: number;
+  child: number;
+  senior: number;
+  fee: number;
+}
+
+export interface ShowtimeDetail {
+  time: string;
+  format: string;
+  bookingUrl: string;
+  score: number;
+  seatRecommendation: SeatRecommendation | null;
+  price: PriceInfo | null;
+}
+
+// Grouped results for the UI
 export interface TheaterResult {
   theater: Theater;
   movie: string;
   bestScore: number;
-  showtimes: {
-    time: string;
-    format: string;
-    bookingUrl: string;
-    score: number;
-  }[];
+  showtimes: ShowtimeDetail[];
 }

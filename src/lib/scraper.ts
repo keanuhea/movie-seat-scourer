@@ -1,5 +1,5 @@
 import { chromium, type Browser, type Page } from "playwright";
-import type { SearchParams, Theater, Showtime, ScoredResult } from "./types";
+import type { SearchParams, Theater, Showtime, ScoredResult, SeatRecommendation, PriceInfo } from "./types";
 
 const FANDANGO_BASE = "https://www.fandango.com";
 
@@ -7,7 +7,8 @@ let browser: Browser | null = null;
 
 async function getBrowser(): Promise<Browser> {
   if (!browser) {
-    browser = await chromium.launch({ headless: true });
+    // Use headed mode — seat map JS doesn't execute in headless
+    browser = await chromium.launch({ headless: false });
   }
   return browser;
 }
@@ -460,4 +461,284 @@ export async function search(params: SearchParams): Promise<ScoredResult[]> {
   } finally {
     await page.close();
   }
+}
+
+// --- Seat Map Scraping ---
+
+interface RawSeat {
+  id: string;
+  row: number;
+  column: number;
+  type: string;
+  status: string; // "A" = available, "R" = reserved/sold
+  x: number;
+  y: number;
+  leftNeighbor?: string;
+  rightNeighbor?: string;
+}
+
+interface SeatMapAPIResponse {
+  data: {
+    seats: RawSeat[];
+    areas: Array<{
+      ticketInfo: Array<{
+        code: string;
+        desc: string;
+        price: string;
+        fee: string;
+      }>;
+    }>;
+    totalAvailableSeatCount: number;
+    totalSeatCount: number;
+  };
+}
+
+export async function scrapeSeatMap(
+  bookingUrl: string,
+  numSeats: number
+): Promise<{ recommendation: SeatRecommendation | null; price: PriceInfo | null }> {
+  const b = await getBrowser();
+  const page = await b.newPage();
+
+  try {
+    // Intercept the seat-map API response for price data
+    let apiResponseJson = "";
+    page.on("response", async (response) => {
+      if (response.url().includes("/seat-map")) {
+        try {
+          apiResponseJson = await response.text();
+        } catch {}
+      }
+    });
+
+    // Navigate to booking URL
+    await page.goto(bookingUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+    // Wait for seat map to render
+    try {
+      await page.waitForSelector(".seat-map__seat", { timeout: 15000 });
+    } catch {
+      console.log("[seats] Seat map did not render in time");
+      return { recommendation: null, price: null };
+    }
+
+    await page.waitForTimeout(1500);
+
+    // Read seats from the DOM
+    const domSeats = await page.evaluate(() => {
+      const seatEls = document.querySelectorAll(".seat-map__seat");
+      return Array.from(seatEls).map(el => ({
+        id: el.id,
+        available: el.classList.contains("availableSeat"),
+        reserved: el.classList.contains("reservedSeat"),
+        wheelchair: el.classList.contains("wheelchairSeat"),
+        companion: el.classList.contains("companionSeat"),
+        left: parseFloat((el as HTMLElement).style.left),
+        top: parseFloat((el as HTMLElement).style.top),
+      }));
+    });
+
+    console.log("[seats] DOM seats found:", domSeats.length, "available:", domSeats.filter(s => s.available).length);
+
+    if (domSeats.length === 0) {
+      return { recommendation: null, price: null };
+    }
+
+    // Convert DOM seats to RawSeat format
+    // Group by top position to determine rows, sort by left for columns
+    const rowGroups = new Map<number, typeof domSeats>();
+    for (const seat of domSeats) {
+      // Round top to nearest 0.5% to group seats into rows
+      const rowKey = Math.round(seat.top * 2) / 2;
+      if (!rowGroups.has(rowKey)) rowGroups.set(rowKey, []);
+      rowGroups.get(rowKey)!.push(seat);
+    }
+
+    const sortedRowKeys = Array.from(rowGroups.keys()).sort((a, b) => a - b);
+    const seats: RawSeat[] = [];
+
+    for (let rowIdx = 0; rowIdx < sortedRowKeys.length; rowIdx++) {
+      const rowKey = sortedRowKeys[rowIdx];
+      const rowSeats = rowGroups.get(rowKey)!.sort((a, b) => a.left - b.left);
+
+      for (let colIdx = 0; colIdx < rowSeats.length; colIdx++) {
+        const s = rowSeats[colIdx];
+        if (s.wheelchair || s.companion) continue; // Skip accessibility seats
+        seats.push({
+          id: s.id,
+          row: rowIdx + 1,
+          column: colIdx + 1,
+          type: "standard",
+          status: s.available ? "A" : "R",
+          x: s.left,
+          y: s.top,
+          leftNeighbor: colIdx > 0 ? rowSeats[colIdx - 1].id : undefined,
+          rightNeighbor: colIdx < rowSeats.length - 1 ? rowSeats[colIdx + 1].id : undefined,
+        });
+      }
+    }
+
+    // Try to read price from the page
+    // Fandango shows pricing info in ticket type areas
+    const priceText = await page.evaluate(() => {
+      // Look for price in various locations
+      const allEls = document.querySelectorAll("*");
+      for (const el of Array.from(allEls)) {
+        const text = el.textContent?.trim() || "";
+        // Match patterns like "$24.49" in short text
+        if (text.match(/^\$\d+\.\d{2}$/) && el.children.length === 0) {
+          return text;
+        }
+      }
+      // Try ticket info section
+      const ticketSection = document.querySelector("[class*='ticket-info'], [class*='TicketInfo'], [class*='price']");
+      if (ticketSection) {
+        const match = ticketSection.textContent?.match(/\$(\d+\.\d{2})/);
+        if (match) return `$${match[1]}`;
+      }
+      return "";
+    });
+
+    let price: PriceInfo | null = null;
+    if (priceText) {
+      const amount = parseFloat(priceText.replace("$", ""));
+      price = { adult: amount, child: amount, senior: amount, fee: 0 };
+    }
+
+    // Try to get detailed pricing from the intercepted API response
+    if (apiResponseJson) {
+      try {
+        const apiData = JSON.parse(apiResponseJson);
+        const seatData = apiData.data || apiData;
+        if (seatData.areas?.[0]?.ticketInfo) {
+          const tickets = seatData.areas[0].ticketInfo;
+          const adult = tickets.find((t: { desc: string; price: string; fee: string }) =>
+            t.desc.toLowerCase().includes("adult")
+          );
+          const child = tickets.find((t: { desc: string; price: string; fee: string }) =>
+            t.desc.toLowerCase().includes("child")
+          );
+          const senior = tickets.find((t: { desc: string; price: string; fee: string }) =>
+            t.desc.toLowerCase().includes("senior")
+          );
+          if (adult) {
+            price = {
+              adult: parseFloat(adult.price),
+              child: child ? parseFloat(child.price) : parseFloat(adult.price),
+              senior: senior ? parseFloat(senior.price) : parseFloat(adult.price),
+              fee: parseFloat(adult.fee),
+            };
+          }
+        }
+      } catch {}
+    }
+
+    console.log("[seats] Price:", price ? `$${price.adult} + $${price.fee} fee` : "not found");
+
+    // Find best seats
+    const recommendation = findBestSeats(seats, numSeats);
+    console.log("[seats] Recommendation:", recommendation?.description || "none");
+
+    return { recommendation, price };
+  } catch (err) {
+    console.log("[seats] Error scraping seat map:", err);
+    return { recommendation: null, price: null };
+  } finally {
+    await page.close();
+  }
+}
+
+function findBestSeats(seats: RawSeat[], numSeats: number): SeatRecommendation | null {
+  // Get available standard seats only
+  const available = seats.filter((s) => s.status === "A" && s.type === "standard");
+  if (available.length < numSeats) return null;
+
+  // Group by row number
+  const rowMap = new Map<number, RawSeat[]>();
+  for (const seat of available) {
+    if (!rowMap.has(seat.row)) rowMap.set(seat.row, []);
+    rowMap.get(seat.row)!.push(seat);
+  }
+
+  // Get total row count from all seats (not just available)
+  const allRows = new Set(seats.map((s) => s.row));
+  const totalRows = allRows.size;
+
+  // Find the center column
+  const allColumns = seats.map((s) => s.column);
+  const minCol = Math.min(...allColumns);
+  const maxCol = Math.max(...allColumns);
+  const centerCol = (minCol + maxCol) / 2;
+
+  // Sort rows by row number
+  const sortedRowNums = Array.from(allRows).sort((a, b) => a - b);
+
+  let bestGroup: { seats: RawSeat[]; score: number } | null = null;
+
+  for (const [rowNum, rowSeats] of rowMap.entries()) {
+    // RULE: Must be at least past the 3 rows closest to the screen (row 4+)
+    const rowIndex = sortedRowNums.indexOf(rowNum); // 0-indexed from screen
+    if (rowIndex < 3) continue;
+
+    // Sort seats by column
+    const sorted = rowSeats.sort((a, b) => a.column - b.column);
+
+    // Find groups of N adjacent seats using neighbor links
+    for (let i = 0; i <= sorted.length - numSeats; i++) {
+      const group = sorted.slice(i, i + numSeats);
+
+      // Check adjacency: each seat should be neighbor of the next
+      let isAdjacent = true;
+      for (let j = 0; j < group.length - 1; j++) {
+        if (group[j].rightNeighbor !== group[j + 1].id && group[j + 1].leftNeighbor !== group[j].id) {
+          // Fall back to column check
+          if (group[j + 1].column - group[j].column !== 1) {
+            isAdjacent = false;
+            break;
+          }
+        }
+      }
+      if (!isAdjacent) continue;
+
+      // Score this group
+      // Center score (0-50): how close the group center is to the theater center column
+      const groupCenterCol = group.reduce((sum, s) => sum + s.column, 0) / group.length;
+      const maxOffset = (maxCol - minCol) / 2;
+      const centerOffset = Math.abs(groupCenterCol - centerCol);
+      const centerScore = Math.max(0, 50 * (1 - centerOffset / maxOffset));
+
+      // Row score (0-50): ideal row is ~60% back (slightly behind center)
+      const idealRowIndex = Math.floor(totalRows * 0.6);
+      const rowDist = Math.abs(rowIndex - idealRowIndex);
+      const rowScore = Math.max(0, 50 * (1 - rowDist / (totalRows / 2)));
+
+      const totalScore = centerScore + rowScore;
+
+      if (!bestGroup || totalScore > bestGroup.score) {
+        bestGroup = { seats: group, score: totalScore };
+      }
+    }
+  }
+
+  if (!bestGroup) return null;
+
+  const group = bestGroup.seats;
+  const rowLetter = group[0].id.replace(/\d+/g, "");
+  const seatNumbers = group.map((s) => s.id);
+  const rowIndex = sortedRowNums.indexOf(group[0].row);
+
+  // Build a nice description
+  const seatNums = group.map((s) => parseInt(s.id.replace(/[A-Z]+/g, ""), 10));
+  const seatRange = seatNums.length === 1
+    ? `Seat ${seatNums[0]}`
+    : `Seats ${Math.min(...seatNums)}-${Math.max(...seatNums)}`;
+
+  return {
+    seats: seatNumbers,
+    row: rowLetter,
+    rowNumber: rowIndex + 1,
+    totalRows,
+    score: Math.round(bestGroup.score),
+    description: `Row ${rowLetter}, ${seatRange} (row ${rowIndex + 1} of ${totalRows})`,
+  };
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import type { TheaterResult } from "@/lib/types";
+import type { TheaterResult, ShowtimeDetail } from "@/lib/types";
 
 interface ResultCardProps {
   result: TheaterResult;
@@ -35,6 +35,13 @@ function getFormatBadge(format: string): { emoji: string; color: string } {
   return { emoji: "🎬", color: "bg-stone-500/15 text-stone-400 border-stone-500/20" };
 }
 
+function getSeatScoreColor(score: number): string {
+  if (score >= 80) return "text-emerald-400";
+  if (score >= 60) return "text-amber-400";
+  if (score >= 40) return "text-orange-400";
+  return "text-stone-400";
+}
+
 const CHAIN_COLORS: Record<string, string> = {
   AMC: "bg-red-500/10 text-red-300 border-red-500/20",
   Regal: "bg-purple-500/10 text-purple-300 border-purple-500/20",
@@ -47,6 +54,48 @@ const CHAIN_COLORS: Record<string, string> = {
   Independent: "bg-stone-500/10 text-stone-400 border-stone-500/20",
 };
 
+function SeatBadge({ showtime }: { showtime: ShowtimeDetail }) {
+  const rec = showtime.seatRecommendation;
+  if (!rec) return null;
+
+  return (
+    <div className="mt-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
+      <div className="flex items-center gap-2">
+        <span className="text-sm">💺</span>
+        <div>
+          <p className="text-xs font-semibold text-emerald-300">
+            Best seats: {rec.description}
+          </p>
+          <div className="mt-0.5 flex items-center gap-3 text-[11px] text-stone-400">
+            <span className={`font-medium ${getSeatScoreColor(rec.score)}`}>
+              Seat score: {rec.score}/100
+            </span>
+            <span>
+              {rec.rowNumber <= rec.totalRows * 0.4
+                ? "Front section"
+                : rec.rowNumber <= rec.totalRows * 0.7
+                ? "Sweet spot 🎯"
+                : "Back section"}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PriceBadge({ showtime }: { showtime: ShowtimeDetail }) {
+  const price = showtime.price;
+  if (!price) return null;
+
+  return (
+    <span className="inline-flex items-center gap-1 rounded-md bg-green-500/10 border border-green-500/20 px-2 py-0.5 text-xs font-medium text-green-300">
+      💲{price.adult.toFixed(2)}
+      <span className="text-[10px] text-green-400/60">+ ${price.fee.toFixed(2)} fee</span>
+    </span>
+  );
+}
+
 export default function ResultCard({ result, rank }: ResultCardProps) {
   const { theater, bestScore, showtimes } = result;
   const chainColor = CHAIN_COLORS[theater.chain] || CHAIN_COLORS.Independent;
@@ -54,7 +103,7 @@ export default function ResultCard({ result, rank }: ResultCardProps) {
   const rankBadge = getRankBadge(rank);
 
   // Group showtimes by format
-  const formatGroups = new Map<string, typeof showtimes>();
+  const formatGroups = new Map<string, ShowtimeDetail[]>();
   for (const st of showtimes) {
     const key = st.format;
     if (!formatGroups.has(key)) formatGroups.set(key, []);
@@ -62,6 +111,8 @@ export default function ResultCard({ result, rank }: ResultCardProps) {
   }
 
   const isTop3 = rank <= 3;
+  // Find the showtime with a seat recommendation
+  const featuredShowtime = showtimes.find((st) => st.seatRecommendation);
 
   return (
     <div className={`overflow-hidden rounded-2xl border transition-all hover:scale-[1.01] hover:shadow-xl ${
@@ -89,18 +140,31 @@ export default function ResultCard({ result, rank }: ResultCardProps) {
             </div>
           </div>
         </div>
-        <div className={`flex flex-col items-center gap-0.5 rounded-xl border px-3 py-2 ${scoreInfo.bg}`}>
-          <div className={`text-lg font-extrabold leading-none ${scoreInfo.color}`}>
-            {bestScore}
+        <div className="flex flex-col items-center gap-1">
+          <div className={`flex flex-col items-center gap-0.5 rounded-xl border px-3 py-2 ${scoreInfo.bg}`}>
+            <div className={`text-lg font-extrabold leading-none ${scoreInfo.color}`}>
+              {bestScore}
+            </div>
+            <div className={`text-[10px] font-medium ${scoreInfo.color}`}>
+              {scoreInfo.label}
+            </div>
           </div>
-          <div className={`text-[10px] font-medium ${scoreInfo.color}`}>
-            {scoreInfo.label}
-          </div>
+          {/* Price badge */}
+          {showtimes[0]?.price && (
+            <PriceBadge showtime={showtimes[0]} />
+          )}
         </div>
       </div>
 
+      {/* Seat Recommendation */}
+      {featuredShowtime && (
+        <div className="px-5 pb-1">
+          <SeatBadge showtime={featuredShowtime} />
+        </div>
+      )}
+
       {/* Showtimes by format */}
-      <div className="px-5 pb-4 space-y-3">
+      <div className="px-5 py-3 space-y-3">
         {Array.from(formatGroups.entries()).map(([format, times]) => {
           const badge = getFormatBadge(format);
           return (
@@ -121,6 +185,9 @@ export default function ResultCard({ result, rank }: ResultCardProps) {
                     className="group relative rounded-lg bg-stone-800/80 px-3 py-1.5 text-sm font-medium text-stone-300 transition-all hover:-translate-y-0.5 hover:bg-amber-500/20 hover:text-amber-200 hover:shadow-md hover:shadow-amber-900/20"
                   >
                     {st.time}
+                    {st.seatRecommendation && (
+                      <span className="ml-1 text-emerald-400">*</span>
+                    )}
                   </a>
                 ))}
               </div>
