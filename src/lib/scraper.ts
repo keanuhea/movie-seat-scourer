@@ -69,9 +69,17 @@ async function findMovies(
 
   // If searching for a specific movie, only return the best match
   if (query) {
-    const queryLower = query.toLowerCase();
-    // Sort by relevance: exact match first, then starts-with, then contains
-    results.sort((a, b) => {
+    const queryLower = query.toLowerCase().trim();
+
+    // Filter out special event variants (early access, fan events, etc.)
+    const specialEventWords = ["early access", "prime member", "fan event", "marathon", "double feature", "re-release"];
+    const mainReleases = results.filter(
+      (m) => !specialEventWords.some((w) => m.title.toLowerCase().includes(w))
+    );
+    const pool = mainReleases.length > 0 ? mainReleases : results;
+
+    // Sort by relevance: exact match, then shortest title that starts with query
+    pool.sort((a, b) => {
       const aLower = a.title.toLowerCase();
       const bLower = b.title.toLowerCase();
       const aExact = aLower === queryLower ? 0 : 1;
@@ -80,11 +88,10 @@ async function findMovies(
       const aStarts = aLower.startsWith(queryLower) ? 0 : 1;
       const bStarts = bLower.startsWith(queryLower) ? 0 : 1;
       if (aStarts !== bStarts) return aStarts - bStarts;
-      const aContains = aLower.includes(queryLower) ? 0 : 1;
-      const bContains = bLower.includes(queryLower) ? 0 : 1;
-      return aContains - bContains;
+      // Prefer shorter titles (less likely to be a variant)
+      return a.title.length - b.title.length;
     });
-    return results.slice(0, 1); // Only the best match
+    return pool.slice(0, 1);
   }
 
   return results.slice(0, 5);
@@ -380,8 +387,11 @@ export async function search(params: SearchParams): Promise<ScoredResult[]> {
   const page = await b.newPage();
 
   try {
+    console.log("[scraper] Search params:", JSON.stringify(params));
+
     // Step 1: Find movies
     const movies = await findMovies(page, params.movie || undefined);
+    console.log("[scraper] Movies found:", movies.length, movies.map(m => m.title));
     if (movies.length === 0) return [];
 
     // Step 2: Get showtimes
@@ -394,20 +404,31 @@ export async function search(params: SearchParams): Promise<ScoredResult[]> {
         params.area,
         params.dateFrom
       );
+      console.log(`[scraper] Showtimes for "${movie.title}":`, showtimes.length);
       allShowtimes.push(...showtimes);
     }
+    console.log("[scraper] Total showtimes:", allShowtimes.length);
 
     // Step 3: Filter by time range
     let filtered = allShowtimes.filter((s) =>
       isInTimeRange(s.dateTime, params.timeFrom, params.timeTo)
     );
+    console.log("[scraper] After time filter:", filtered.length);
 
     // Step 4: Filter by geographic area
+    const beforeGeo = filtered.length;
     filtered = filtered.filter(
       (s) =>
         matchesArea(s.theater.address, params.area) &&
         filterByStreetConstraint(s.theater.address, params.area)
     );
+    console.log("[scraper] After geo filter:", filtered.length, `(removed ${beforeGeo - filtered.length})`);
+    if (filtered.length === 0 && allShowtimes.length > 0) {
+      console.log("[scraper] Sample addresses that were filtered out:");
+      allShowtimes.slice(0, 5).forEach(s =>
+        console.log(`  "${s.theater.address}" matchesArea=${matchesArea(s.theater.address, params.area)} streetConstraint=${filterByStreetConstraint(s.theater.address, params.area)}`)
+      );
+    }
 
     // Step 5: Score and rank
     const results: ScoredResult[] = filtered.map((showtime) => {
@@ -434,6 +455,7 @@ export async function search(params: SearchParams): Promise<ScoredResult[]> {
       return a.showtime.dateTime.localeCompare(b.showtime.dateTime);
     });
 
+    console.log("[scraper] Final results:", results.length);
     return results;
   } finally {
     await page.close();

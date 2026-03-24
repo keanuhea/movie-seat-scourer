@@ -28,16 +28,29 @@ export interface SeatGroup {
   seats: string[];
   rowIndex: number;
   totalRows: number;
-  centerOffset: number; // 0 = dead center, higher = further from center
+  centerOffset: number;
 }
 
 export interface ScoredResult {
   showtime: Showtime;
   bestSeatGroup: SeatGroup | null;
-  score: number; // 0-100, higher is better
+  score: number;
   scoreBreakdown: {
     centerScore: number;
     middleRowScore: number;
     amenityScore: number;
   };
+}
+
+// Grouped results for the UI — one entry per theater
+export interface TheaterResult {
+  theater: Theater;
+  movie: string;
+  bestScore: number;
+  showtimes: {
+    time: string;
+    format: string;
+    bookingUrl: string;
+    score: number;
+  }[];
 }
